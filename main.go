@@ -69,6 +69,11 @@ const (
 	// pollInterval is how often Create polls GET /machines/{id} while
 	// waiting for the daemon to flip status from "pending" to "running".
 	pollInterval = 250 * time.Millisecond
+	// consoleTailLines is how much serial-console history we attach to
+	// failure messages so the runner (and the user staring at Forgejo)
+	// can see kernel panics, initd errors, or rootfs-prep traces when a
+	// VM never gets to the point of accepting an Exec.
+	consoleTailLines = 200
 	// readyTimeout caps the wait for image pull + boot + initd up.
 	readyTimeout = 5 * time.Minute
 )
@@ -256,14 +261,53 @@ func (s *server) waitRunning(ctx context.Context, id string) error {
 		case "running":
 			return nil
 		case "failed", "exited":
-			return status.Errorf(codes.Internal, "machine entered %s: %s", dto.Status, dto.Error)
+			return s.failureWithConsole(id, fmt.Sprintf("machine entered %s: %s", dto.Status, dto.Error))
 		}
 		select {
 		case <-ctx.Done():
-			return status.Errorf(codes.DeadlineExceeded, "machine never became running: %v", ctx.Err())
+			return s.failureWithConsole(id, fmt.Sprintf("machine never became running: %v", ctx.Err()))
 		case <-ticker.C:
 		}
 	}
+}
+
+// fetchConsoleTail returns the last N lines of the serial console history
+// for id, or empty on any error (we never want a failed log fetch to mask
+// the real failure). Bounded by ctx and a short fallback timeout for the
+// case where the underlying ctx is already expired.
+func (s *server) fetchConsoleTail(id string, lines int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	q := url.Values{}
+	q.Set("tail", fmt.Sprintf("%d", lines))
+	req, err := s.newRequest(ctx, http.MethodGet,
+		"/machines/"+url.PathEscape(id)+"/logs?"+q.Encode(), nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := s.http.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(body), "\n")
+}
+
+// failureWithConsole wraps a base error message with the recent
+// serial-console output (if any) so the runner can show it to the user.
+func (s *server) failureWithConsole(id, msg string) error {
+	tail := s.fetchConsoleTail(id, consoleTailLines)
+	if tail == "" {
+		return status.Errorf(codes.Internal, "%s", msg)
+	}
+	return status.Errorf(codes.Internal, "%s\n--- serial console (last %d lines) ---\n%s", msg, consoleTailLines, tail)
 }
 
 // Start is a no-op for hyperfleet: the daemon transitions the VM from
@@ -285,7 +329,7 @@ func (s *server) Start(ctx context.Context, req *pluginv1.StartRequest) (*plugin
 			if err == nil {
 				err = errors.New("not ready")
 			}
-			return nil, status.Errorf(codes.Unavailable, "initd not ready: %v", err)
+			return nil, s.failureWithConsole(id, fmt.Sprintf("initd not ready: %v", err))
 		}
 		select {
 		case <-ctx.Done():
@@ -346,14 +390,22 @@ func (s *server) Exec(req *pluginv1.ExecRequest, stream pluginv1.BackendPlugin_E
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.ContentLength = int64(buf.Len())
 
+	envID := req.GetEnvironmentId()
+
 	resp, err := s.http.Do(httpReq)
 	if err != nil {
+		// Plugin → daemon dial failed (daemon down? wrong URL?). The
+		// runner has nothing else to learn from console logs in this
+		// case — it's a host-side issue.
 		return status.Errorf(codes.Internal, "exec http: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return status.Errorf(codes.Internal, "exec: %s: %s", resp.Status, body)
+		// 5xx here usually means the daemon couldn't reach the in-guest
+		// initd, so the serial console is the most useful diagnostic.
+		return s.execFailWithConsole(envID, stream,
+			fmt.Sprintf("exec: %s: %s", resp.Status, body))
 	}
 
 	// Stream frames; relay each to the runner.
@@ -361,16 +413,19 @@ func (s *server) Exec(req *pluginv1.ExecRequest, stream pluginv1.BackendPlugin_E
 	for {
 		if _, err := io.ReadFull(resp.Body, hdr); err != nil {
 			if errors.Is(err, io.EOF) {
-				return status.Errorf(codes.Internal, "exec: stream ended before exit frame")
+				return s.execFailWithConsole(envID, stream,
+					"exec: stream ended before exit frame")
 			}
-			return status.Errorf(codes.Internal, "exec frame header: %v", err)
+			return s.execFailWithConsole(envID, stream,
+				fmt.Sprintf("exec frame header: %v", err))
 		}
 		kind := hdr[0]
 		length := binary.BigEndian.Uint32(hdr[1:5])
 		payload := make([]byte, length)
 		if length > 0 {
 			if _, err := io.ReadFull(resp.Body, payload); err != nil {
-				return status.Errorf(codes.Internal, "exec frame payload: %v", err)
+				return s.execFailWithConsole(envID, stream,
+					fmt.Sprintf("exec frame payload: %v", err))
 			}
 		}
 		switch kind {
@@ -407,6 +462,22 @@ func (s *server) Exec(req *pluginv1.ExecRequest, stream pluginv1.BackendPlugin_E
 			return status.Errorf(codes.Internal, "exec: unknown frame kind %d", kind)
 		}
 	}
+}
+
+// execFailWithConsole reports an Exec failure to the runner as a terminal
+// ExecOutput frame with exit code 1 and an error message that embeds the
+// recent serial-console tail. We hand it back as a normal frame (not a
+// gRPC error) so Forgejo renders it inline in the step's log pane rather
+// than swallowing it behind a generic "rpc error: …".
+func (s *server) execFailWithConsole(id string, stream pluginv1.BackendPlugin_ExecServer, msg string) error {
+	if tail := s.fetchConsoleTail(id, consoleTailLines); tail != "" {
+		msg = fmt.Sprintf("%s\n--- serial console (last %d lines) ---\n%s", msg, consoleTailLines, tail)
+	}
+	return stream.Send(&pluginv1.ExecOutput{
+		Done:         true,
+		ExitCode:     1,
+		ErrorMessage: msg,
+	})
 }
 
 // CopyIn buffers the streamed tar into memory then PUTs it. The runner
