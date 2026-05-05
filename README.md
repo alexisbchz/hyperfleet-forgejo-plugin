@@ -149,6 +149,36 @@ UI:
 
 ![fail log](docs/screenshots/logs-06-intentional-failure-failure.png)
 
+### Failures that happen *before* the step ever runs
+
+The plugin proxies hyperfleet's `GET /machines/{id}/logs` (a tail of the
+serial console) into every Create / Start / Exec failure path, so when a
+boot or initd error kills the VM before any step can run, the runner —
+and Forgejo's UI — gets the actual diagnostic instead of a generic
+"rpc error: …".
+
+A workflow that pins `container.image` to a non-existent OCI ref:
+
+```yaml
+jobs:
+  pull-fails:
+    runs-on: hyperfleet
+    container:
+      image: docker.io/library/this-image-does-not-exist:none
+    steps:
+      - run: echo "should never get here"
+```
+
+surfaces the containerd resolver's actual error in the Set-up-job log:
+
+![pull failure](docs/screenshots/logs-pull-failure.png)
+
+Pre-boot failures like this one have nothing in the serial-console
+history yet, so the wrapper degrades to the bare daemon message; once
+the VM gets far enough to print kernel boot lines or initd's own
+diagnostics, those are appended below a `--- serial console (last 200
+lines) ---` separator.
+
 ## Tests
 
 Unit tests:
