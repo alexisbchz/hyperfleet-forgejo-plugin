@@ -8,6 +8,8 @@ microVMs.
 forgejo-runner ── go-plugin ──> hyperfleet-forgejo-plugin ── HTTP ──> hyperfleet daemon ── vsock ──> in-guest initd
 ```
 
+![Forgejo Actions overview, four jobs run on hyperfleet microVMs](docs/screenshots/01-actions-overview.png)
+
 The runner launches the plugin as a subprocess via
 [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin); each
 `pluginv1.BackendPlugin` RPC translates into one or more HTTP calls against
@@ -111,6 +113,41 @@ the machine map, and the daemon's machine ID is the `environment_id`
 returned to the runner. That means killing the plugin process never leaves
 hyperfleet in an inconsistent state — `forgejo-runner` will simply launch a
 fresh subprocess on the next job.
+
+## End-to-end demo
+
+The screenshots in [`docs/screenshots/`](docs/screenshots) come from a
+local run of three workflows in `alice/hyperfleet-demo` covering parallel
+jobs, `$GITHUB_ENV` round-trip, and intentional non-zero exit.
+
+### Real microVM output streamed back to Forgejo
+
+`uname -a` from inside the guest, with the microVM's IP and the kernel
+that boots it:
+
+![uname log](docs/screenshots/logs-04-uname-success.png)
+
+A second job in the same workflow does loop arithmetic and pipes
+`seq 1 100` through `awk` — the `5050` lands in Forgejo's log pane:
+
+![arithmetic log](docs/screenshots/logs-04-arithmetic-success.png)
+
+### `$GITHUB_ENV` round-trip
+
+Step 1 appends `BUILD_ID=…` to `$GITHUB_ENV`; step 2 reads it back. The
+plugin's `UpdateEnv` RPC pulls the file out of the guest via
+`GET /files`, parses `K=V`, and feeds the map into the next step's
+environment.
+
+![env demo log](docs/screenshots/logs-05-pass-env-between-steps-success.png)
+
+### Exit-code propagation
+
+A step ending in `exit 7` shows the framed protocol carrying an int32
+exit code out of the guest, through the daemon, and into a red ❌ in the
+UI:
+
+![fail log](docs/screenshots/logs-06-intentional-failure-failure.png)
 
 ## Tests
 
