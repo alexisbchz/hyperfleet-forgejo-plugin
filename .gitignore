@@ -1,0 +1,12 @@
+# Binaries / build output
+/bin/
+*.test
+*.out
+
+# Vendored fork referenced by the local `replace` directive in go.mod.
+# Anyone reproducing the build clones it themselves — see README.
+/.deps/
+
+# Editor / OS noise
+.DS_Store
+*.swp
